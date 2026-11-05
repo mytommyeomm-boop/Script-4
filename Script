@@ -1,0 +1,499 @@
+--[[
+    Bug Evolution — AutoFarm (Rayfield UI)
+    เน้นเก็บ XP Orb (ก้อนเลเวล) ในแมพ
+    Toggle: ปุ่มใน UI
+]]
+
+-- ============================================================
+-- LOAD RAYFIELD
+-- ============================================================
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- ============================================================
+-- SERVICES / REFS
+-- ============================================================
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LP          = Players.LocalPlayer
+local Remotes     = ReplicatedStorage:WaitForChild("Remotes")
+local SpiderDefs  = require(ReplicatedStorage.Shared.SpiderDefs)
+local Stages      = require(ReplicatedStorage.Shared.Stages)
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local State = {
+    Enabled       = false,
+    Mode          = "Hybrid",       -- "Walk" | "Teleport" | "Hybrid"
+    Range         = 400,
+    TpThreshold   = 60,             -- Hybrid: ไกลกว่านี้วาป
+    CollectOrbs   = true,
+    KillBugs      = false,
+    BreakObjects  = false,
+    AutoAbility   = false,
+    AutoEvolve    = false,
+    AutoSprint    = false,
+    Target        = nil,
+    Kind          = nil,
+    Status        = "idle",
+    LastAttack    = 0,
+    LastEvolve    = 0,
+    StuckT        = 0,
+    LastPos       = nil,
+    NextJump      = 0,
+}
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function char() return LP.Character end
+local function hum()  local c=char(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function root() local c=char(); return c and c:FindFirstChild("HumanoidRootPart") end
+
+local function alive()
+    local h = hum()
+    return h and h.Health > 0 and LP:GetAttribute("Alive") == true
+end
+
+local function blocked()
+    if LP:GetAttribute("InTutorial")   then return true end
+    if LP:GetAttribute("Transforming") then return true end
+    local c = char()
+    if c and c:GetAttribute("SelfRoot") then return true end
+    local h = hum()
+    if h and h:GetAttribute("Stunned") then return true end
+    return false
+end
+
+local function stopMove()
+    local h = hum(); if not h then return end
+    local rp = h.RootPart
+    if rp then h:MoveTo(rp.Position) end
+end
+
+local function walkTo(pos)
+    local h = hum(); if not h then return end
+    h:MoveTo(pos)
+end
+
+local function tpTo(pos)
+    local r = root(); if not r then return end
+    -- วาปทีละนิดกัน anti-cheat คร่าว ๆ
+    r.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+end
+
+-- ============================================================
+-- FINDERS
+-- ============================================================
+local function findNearestOrb(maxRange)
+    local folder = workspace:FindFirstChild("Orbs")
+    if not folder then return nil end
+    local r = root(); if not r then return nil end
+    local best, bestD = nil, maxRange
+    for _, o in folder:GetChildren() do
+        if not o:IsA("BasePart") then continue end
+        if o:GetAttribute("BurstFrom") then continue end   -- กำลังเล่นแอนิเมชัน
+        local d = (o.Position - r.Position).Magnitude
+        if d < bestD then
+            best, bestD = o, d
+        end
+    end
+    return best
+end
+
+local function canTarget(target)
+    if not target or not target.Parent then return false end
+    if target == char() then return false end
+    if target:GetAttribute("OwnerId") == LP.UserId then return false end
+    if target:GetAttribute("Boss") then return false end
+
+    local h = target:FindFirstChildOfClass("Humanoid")
+    if h then
+        if h.Health <= 0 then return false end
+    elseif (target:GetAttribute("HP") or 0) <= 0 then
+        return false
+    end
+
+    if target:GetAttribute("IsPlayer") then return false end   -- ไม่ตีผู้เล่น
+    return true
+end
+
+local function findNearestBug(maxRange)
+    local r = root(); if not r then return nil end
+    local best, bestD = nil, maxRange
+    for _, c in CollectionService:GetTagged("Creature") do
+        if not c.Parent then continue end
+        if c:GetAttribute("Kind") ~= "Bug" then continue end
+        if c:GetAttribute("Corpse") then continue end
+        if not canTarget(c) then continue end
+        local hrp = c:FindFirstChild("HumanoidRootPart"); if not hrp then continue end
+        local d = (hrp.Position - r.Position).Magnitude
+        if d < bestD then best, bestD = c, d end
+    end
+    return best
+end
+
+local function findNearestBreakable(maxRange)
+    local r = root(); if not r then return nil end
+    local best, bestD = nil, maxRange
+    for _, o in CollectionService:GetTagged("Breakable") do
+        if not o.Parent or not o.PrimaryPart then continue end
+        if (o:GetAttribute("HP") or 0) <= 0 then continue end
+        if o:GetAttribute("SpiderEgg") then continue end
+        if o:GetAttribute("TutorialFor") then continue end
+        if not canTarget(o) then continue end
+        local d = (o.PrimaryPart.Position - r.Position).Magnitude
+        if d < bestD then best, bestD = o, d end
+    end
+    return best
+end
+
+local function posOf(target)
+    if not target or not target.Parent then return nil end
+    if target:IsA("BasePart") then return target.Position end
+    if target:IsA("Model") then
+        local pr = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart")
+        return pr and pr.Position
+    end
+    return nil
+end
+
+-- ============================================================
+-- ACTIONS
+-- ============================================================
+local function doAttack(target)
+    local now = os.clock()
+    local aspd = (LP:GetAttribute("AttackSpeed") or 1)
+               * (LP:GetAttribute("AttackSpeedMult") or 1)
+    local cd = 1 / math.max(aspd, 0.1)
+    if now - State.LastAttack < cd then return end
+    State.LastAttack = now
+    Remotes.Attack:FireServer(target)
+end
+
+local function doAbilities(dist)
+    if not State.AutoAbility then return end
+    local slots = LP:GetAttribute("AbilitySlots") or 0
+    if slots < 1 then return end
+    local now = workspace:GetServerTimeNow()
+    if slots >= 1 and dist > 8
+       and now >= (LP:GetAttribute("Ability1Ready") or 0) + 0.3 then
+        Remotes.UseAbility:FireServer(1)
+    end
+    if slots >= 2 and dist < 15
+       and now >= (LP:GetAttribute("Ability2Ready") or 0) + 0.3 then
+        Remotes.UseAbility:FireServer(2)
+    end
+end
+
+local function doEvolve()
+    if not State.AutoEvolve then return end
+    if LP:GetAttribute("InVoidFight") then return end
+    if LP:GetAttribute("AutoEvolveAt") then return end
+    local spiderId = LP:GetAttribute("SpiderId") or ""
+    local spider   = SpiderDefs[spiderId]; if not spider then return end
+    local stage    = LP:GetAttribute("Stage") or 1
+    local level    = LP:GetAttribute("Level") or 1
+    if Stages.Next(spider, stage, level) then
+        if os.clock() - State.LastEvolve > 1.5 then
+            State.LastEvolve = os.clock()
+            pcall(function() Remotes.Evolve:InvokeServer() end)
+        end
+    end
+end
+
+local function doSprint()
+    if not State.AutoSprint then return end
+    if LP:GetAttribute("AlwaysSprint") then return end
+    if LP:GetAttribute("Exhausted") then return end
+    if (LP:GetAttribute("Stamina") or 0) < 1 then return end
+    Remotes.SetSprint:FireServer(true)
+end
+
+-- ============================================================
+-- UPDATE LOOP
+-- ============================================================
+local function pickTarget()
+    if State.CollectOrbs then
+        local orb = findNearestOrb(State.Range)
+        if orb then return orb, "Orb" end
+    end
+    if State.KillBugs then
+        local bug = findNearestBug(State.Range)
+        if bug then return bug, "Bug" end
+    end
+    if State.BreakObjects then
+        local obj = findNearestBreakable(State.Range)
+        if obj then return obj, "Breakable" end
+    end
+    return nil, nil
+end
+
+local function update(dt)
+    if not State.Enabled then return end
+
+    if not alive() or blocked() then
+        stopMove()
+        State.Status = "idle (dead/blocked)"
+        return
+    end
+
+    doEvolve()
+    doSprint()
+
+    local r = root(); if not r then return end
+
+    -- validate target
+    local cur = State.Target
+    local valid = false
+    if cur and cur.Parent then
+        if State.Kind == "Orb" then
+            valid = not cur:GetAttribute("BurstFrom")
+        else
+            valid = canTarget(cur)
+        end
+    end
+
+    if not valid then
+        State.Target, State.Kind = pickTarget()
+        cur = State.Target
+    end
+
+    if not cur then
+        stopMove()
+        State.Status = "no target"
+        return
+    end
+
+    local tp = posOf(cur)
+    if not tp then State.Target = nil; return end
+
+    local dist = (tp - r.Position).Magnitude
+    State.Status = string.format("%s (%.0f)", State.Kind, dist)
+
+    if State.Kind == "Orb" then
+        if State.Mode == "Teleport"
+           or (State.Mode == "Hybrid" and dist > State.TpThreshold) then
+            if dist > 3 then
+                tpTo(tp)
+            else
+                walkTo(tp)
+            end
+        else
+            walkTo(tp)
+        end
+    else
+        if dist <= 4.5 then
+            doAttack(cur)
+            doAbilities(dist)
+            stopMove()
+        else
+            walkTo(tp)
+            doAbilities(dist)
+        end
+    end
+
+    -- anti-stuck
+    if State.LastPos then
+        local moved = (r.Position - State.LastPos).Magnitude
+        if moved < 0.5 then
+            State.StuckT = State.StuckT + dt
+            if State.StuckT > 1.5 and os.clock() > State.NextJump then
+                local h = hum()
+                if h then h.Jump = true end
+                State.NextJump = os.clock() + 1.5
+                State.StuckT = 0
+            end
+        else
+            State.StuckT = 0
+        end
+    end
+    State.LastPos = r.Position
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    local ok, err = pcall(update, dt)
+    if not ok then warn("[AutoFarm] " .. tostring(err)) end
+end)
+
+LP.CharacterAdded:Connect(function()
+    State.Target = nil
+    State.LastPos = nil
+end)
+
+-- ============================================================
+-- RAYFIELD UI
+-- ============================================================
+local Window = Rayfield:CreateWindow({
+    Name = "Bug Evolution — AutoFarm",
+    LoadingTitle = "AutoFarm loading...",
+    LoadingSubtitle = "by you",
+    Theme = "Default",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "BugEvolutionAutoFarm",
+        FileName = "Config",
+    },
+    KeySystem = false,
+})
+
+-- ---------- Farm Tab ----------
+local FarmTab = Window:CreateTab("Farm", 4483362458)
+
+FarmTab:CreateToggle({
+    Name = "AutoFarm (Master)",
+    CurrentValue = false,
+    Flag = "AutoFarm",
+    Callback = function(v)
+        State.Enabled = v
+        if not v then
+            stopMove()
+            State.Target = nil
+            State.LastPos = nil
+        end
+    end,
+})
+
+FarmTab:CreateSection("เก็บเลเวล")
+
+FarmTab:CreateToggle({
+    Name = "เก็บ Orb XP (ก้อนเลเวล)",
+    CurrentValue = true,
+    Flag = "CollectOrbs",
+    Callback = function(v) State.CollectOrbs = v end,
+})
+
+FarmTab:CreateSlider({
+    Name = "ระยะค้นหา (studs)",
+    Range = { 30, 2000 },
+    Increment = 10,
+    Suffix = "studs",
+    CurrentValue = 400,
+    Flag = "Range",
+    Callback = function(v) State.Range = v end,
+})
+
+FarmTab:CreateDropdown({
+    Name = "โหมดการเดิน",
+    Options = { "Walk", "Teleport", "Hybrid" },
+    CurrentOption = { "Hybrid" },
+    Flag = "Mode",
+    Callback = function(opt)
+        State.Mode = (type(opt) == "table") and opt[1] or opt
+    end,
+})
+
+FarmTab:CreateSlider({
+    Name = "Teleport เมื่อไกลกว่า (Hybrid)",
+    Range = { 20, 800 },
+    Increment = 5,
+    Suffix = "studs",
+    CurrentValue = 60,
+    Flag = "TpThreshold",
+    Callback = function(v) State.TpThreshold = v end,
+})
+
+FarmTab:CreateSection("เสริม")
+
+FarmTab:CreateToggle({
+    Name = "ไล่กัดแมลง",
+    CurrentValue = false,
+    Flag = "KillBugs",
+    Callback = function(v) State.KillBugs = v end,
+})
+
+FarmTab:CreateToggle({
+    Name = "กัดของ/ต้นไม้",
+    CurrentValue = false,
+    Flag = "BreakObjects",
+    Callback = function(v) State.BreakObjects = v end,
+})
+
+FarmTab:CreateToggle({
+    Name = "สแปม Ability",
+    CurrentValue = false,
+    Flag = "AutoAbility",
+    Callback = function(v) State.AutoAbility = v end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Evolve อัตโนมัติ",
+    CurrentValue = false,
+    Flag = "AutoEvolve",
+    Callback = function(v) State.AutoEvolve = v end,
+})
+
+FarmTab:CreateToggle({
+    Name = "เปิด Sprint ตลอด",
+    CurrentValue = false,
+    Flag = "AutoSprint",
+    Callback = function(v) State.AutoSprint = v end,
+})
+
+-- ---------- Info Tab ----------
+local InfoTab = Window:CreateTab("Info", 4483362458)
+
+local statusLabel = InfoTab:CreateParagraph({
+    Title = "สถานะ",
+    Content = "idle",
+})
+
+task.spawn(function()
+    while task.wait(0.25) do
+        statusLabel:Set({
+            Title = State.Enabled and "สถานะ (Farm: ON)" or "สถานะ (Farm: OFF)",
+            Content = string.format("target: %s\nmode: %s\nrange: %d\npos: %s",
+                State.Status, State.Mode, State.Range,
+                State.Target and "yes" or "none"),
+        })
+    end
+end)
+
+InfoTab:CreateParagraph({
+    Title = "คำอธิบาย",
+    Content = "• Walk = เดินปกติ (ปลอดภัยสุด)\n"..
+              "• Hybrid = เดินเมื่อใกล้, วาปเมื่อไกล\n"..
+              "• Teleport = วาปตลอด (ไวกว่า, เสี่ยงกว่า)\n"..
+              "• ปรับ Range 400+ เพื่อเก็บ orb ครึ่งแมพ\n"..
+              "• เปิด Evolve เพื่อไต่ stage อัตโนมัติ",
+})
+
+-- ---------- Misc Tab ----------
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+MiscTab:CreateButton({
+    Name = "Teleport ไป Spawn (Meadow Nest)",
+    Callback = function()
+        local r = root(); if r then
+            r.CFrame = CFrame.new(0, 20, 180)
+        end
+    end,
+})
+
+MiscTab:CreateButton({
+    Name = "รีเซ็ตค่าทั้งหมด",
+    Callback = function()
+        State.Range = 400
+        State.Mode = "Hybrid"
+        State.TpThreshold = 60
+        State.CollectOrbs = true
+        State.KillBugs = false
+        State.BreakObjects = false
+        State.AutoAbility = false
+        State.AutoEvolve = false
+        State.AutoSprint = false
+        State.Enabled = false
+        stopMove()
+    end,
+})
+
+Rayfield:Notify({
+    Title = "AutoFarm โหลดเสร็จ",
+    Content = "เปิด toggle ในแท็บ Farm เพื่อเริ่มเก็บเลเวล",
+    Duration = 5,
+    Image = 4483362458,
+})

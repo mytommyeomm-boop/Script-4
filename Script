@@ -1,72 +1,84 @@
---// PLAYER ANIMATION DETECTOR V3
---// เน้นตรวจ Steal Animation + แจ้งเตือนจุดเขียว
+--// PLAYER ANIMATION DETECTOR V5
+--// Compact UI + Self/Others split + Learn Steal
 --// LocalScript | StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
+--// ====== PERSISTENCE ======
+local SAVE_FILE = "AnimDetector_StealIDs.json"
+local learnedStealIDs = {}
+local manualStealIDs  = {}
+
+local function hasFileAPI()
+    return typeof(writefile) == "function" and typeof(isfile) == "function"
+end
+
+local function loadLearned()
+    if not hasFileAPI() then return end
+    local ok, data = pcall(function()
+        if isfile(SAVE_FILE) then
+            return HttpService:JSONDecode(readfile(SAVE_FILE))
+        end
+    end)
+    if ok and typeof(data) == "table" then
+        learnedStealIDs = data.learned or {}
+        manualStealIDs  = data.manual  or {}
+    end
+end
+
+local function saveLearned()
+    if not hasFileAPI() then return end
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode({
+            learned = learnedStealIDs,
+            manual  = manualStealIDs,
+        }))
+    end)
+end
+
+loadLearned()
+
+--// ====== STATE ======
 local monitored = setmetatable({}, {__mode = "k"})
-local entryMap = {}
-local entries = {}
-local seenTracks = setmetatable({}, {__mode = "k"})  -- กันนับ Plays ซ้ำ
+local entryMap  = {}    -- [normalizedID] = entry
+local entries   = {}
+local seenTracks = setmetatable({}, {__mode = "k"})
 
 local totalPlays = 0
 local stealCount = 0
-local minimized = false
+local minimized  = false
 local copyBoxActive = false
 
-local ExpandedSize = UDim2.new(0.9, 0, 0.72, 0)
+local ExpandedSize = UDim2.new(0, 440, 0, 380)
 
---// ====== KNOWLEDGE BASE ======
--- เก็บ keyword ที่บ่งบอกว่าเป็น steal animation
--- เพิ่มเติมได้เรื่อยๆ เมื่อเจอ animation ใหม่
-local STEAL_KEYWORDS = {
-    "steal", "stealing", "snatch", "tackle", "intercept",
-    "strips", "stripping", "dispossess", "takeball", "take ball",
-    "taketheball", "balltake", "ballsnatch", "predator", "ravenous",
-    "shadowstrike", "silentsteal", "silent steal", "survivalinstinct",
-    "predatory", "snatcher", "pickpocket", "larceny"
-}
-
--- keyword ที่บอกว่าเป็นทักษะอื่น (เพื่อไม่ให้สับสน)
+--// ====== CLASSIFY ======
 local OTHER_KEYWORDS = {
-    tackle = { "tackle", "slide", "slidetackle", "slide tackle" },
-    dribble = { "dribble", "dribbling", "feint", "stepover", "roulette" },
-    shoot = { "shoot", "shot", "kick", "volley", "shotpower", "finisher" },
-    skill   = { "skill", "technique", "special", "ult", "flow", "awaken" }
+    tackle  = { "tackle", "slide", "slidetackle" },
+    dribble = { "dribble", "feint", "stepover", "roulette" },
+    shoot   = { "shoot", "shot", "kick", "volley", "finisher" },
+    skill   = { "skill", "special", "ult", "flow", "awaken" },
 }
 
-local function classify(track, animation, name, id)
-    local lowerName = string.lower(name or "")
-    local lowerId = string.lower(id or "")
-
-    -- 1. เช็ค keyword steal ก่อน (ให้ความสำคัญสูงสุด)
-    for _, kw in ipairs(STEAL_KEYWORDS) do
-        if lowerName:find(kw, 1, true) or lowerId:find(kw, 1, true) then
-            return "steal"
-        end
+local function classify(track, name, id, normalizedID)
+    if learnedStealIDs[normalizedID] or manualStealIDs[normalizedID] then
+        return "steal"
     end
-
-    -- 2. เช็ค keyword อื่น
-    for category, keywords in pairs(OTHER_KEYWORDS) do
-        for _, kw in ipairs(keywords) do
+    local lowerName = string.lower(name or "")
+    for category, kws in pairs(OTHER_KEYWORDS) do
+        for _, kw in ipairs(kws) do
             if lowerName:find(kw, 1, true) then
                 return category
             end
         end
     end
-
-    -- 3. ถ้า priority เป็น Core = animation เดิน/วิ่ง/idle ของ Roblox
-    local ok, priority = pcall(function()
-        return track.Priority
-    end)
+    local ok, priority = pcall(function() return track.Priority end)
     if ok and priority == Enum.AnimationPriority.Core then
         return "core"
     end
-
-    -- 4. ค่าเริ่มต้น
     return "other"
 end
 
@@ -87,56 +99,52 @@ Main.BorderSizePixel = 0
 Main.Parent = ScreenGui
 
 local constraint = Instance.new("UISizeConstraint")
-constraint.MinSize = Vector2.new(280, 52)
-constraint.MaxSize = Vector2.new(600, 560)
+constraint.MinSize = Vector2.new(240, 40)
+constraint.MaxSize = Vector2.new(520, 480)
 constraint.Parent = Main
 
-Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
 
 local stroke = Instance.new("UIStroke")
 stroke.Color = Color3.fromRGB(65, 75, 100)
 stroke.Thickness = 1
 stroke.Parent = Main
 
---// Header
+--// Header (40px)
 local Header = Instance.new("Frame")
-Header.Size = UDim2.new(1, 0, 0, 52)
+Header.Size = UDim2.new(1, 0, 0, 40)
 Header.BackgroundColor3 = Color3.fromRGB(29, 34, 48)
 Header.BorderSizePixel = 0
 Header.Parent = Main
-
-Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 10)
 
 local Title = Instance.new("TextLabel")
-Title.Position = UDim2.new(0, 12, 0, 0)
-Title.Size = UDim2.new(1, -100, 1, 0)
+Title.Position = UDim2.new(0, 8, 0, 0)
+Title.Size = UDim2.new(1, -200, 1, 0)
 Title.BackgroundTransparency = 1
 Title.Font = Enum.Font.GothamBold
-Title.Text = "PLAYER ANIMATION DETECTOR V3"
+Title.Text = "ANIM DETECTOR V5"
 Title.TextColor3 = Color3.fromRGB(235, 240, 255)
-Title.TextSize = 13
+Title.TextSize = 11
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = Header
 
---// Steal Badge (จุดเขียว)
+--// Steal Badge
 local StealBadge = Instance.new("Frame")
-StealBadge.Size = UDim2.fromOffset(70, 22)
-StealBadge.Position = UDim2.new(1, -158, 0, 15)
+StealBadge.Size = UDim2.fromOffset(74, 18)
+StealBadge.Position = UDim2.new(1, -142, 0, 11)
 StealBadge.BackgroundColor3 = Color3.fromRGB(20, 80, 45)
 StealBadge.Visible = false
 StealBadge.Parent = Header
-
-Instance.new("UICorner", StealBadge).CornerRadius = UDim.new(0, 11)
+Instance.new("UICorner", StealBadge).CornerRadius = UDim.new(0, 9)
 
 local StealDot = Instance.new("Frame")
-StealDot.Size = UDim2.fromOffset(8, 8)
-StealDot.Position = UDim2.new(0, 8, 0.5, -4)
+StealDot.Size = UDim2.fromOffset(6, 6)
+StealDot.Position = UDim2.new(0, 7, 0.5, -3)
 StealDot.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
 StealDot.Parent = StealBadge
-
 Instance.new("UICorner", StealDot).CornerRadius = UDim.new(1, 0)
 
--- pulse animation ของจุดเขียว
 task.spawn(function()
     while true do
         if not StealBadge.Parent then break end
@@ -156,145 +164,228 @@ task.spawn(function()
 end)
 
 local StealText = Instance.new("TextLabel")
-StealText.Size = UDim2.new(1, -22, 1, 0)
-StealText.Position = UDim2.new(0, 20, 0, 0)
+StealText.Size = UDim2.new(1, -16, 1, 0)
+StealText.Position = UDim2.new(0, 16, 0, 0)
 StealText.BackgroundTransparency = 1
 StealText.Text = "STEAL"
 StealText.TextColor3 = Color3.fromRGB(60, 255, 120)
 StealText.Font = Enum.Font.GothamBold
-StealText.TextSize = 11
+StealText.TextSize = 9
 StealText.Parent = StealBadge
 
---// Minimize
+--// Minimize / Close
 local Minimize = Instance.new("TextButton")
-Minimize.Size = UDim2.fromOffset(32, 34)
-Minimize.Position = UDim2.new(1, -80, 0, 9)
+Minimize.Size = UDim2.fromOffset(26, 28)
+Minimize.Position = UDim2.new(1, -62, 0, 6)
 Minimize.BackgroundColor3 = Color3.fromRGB(55, 75, 110)
 Minimize.Text = "−"
 Minimize.TextColor3 = Color3.new(1, 1, 1)
 Minimize.Font = Enum.Font.GothamBold
-Minimize.TextSize = 20
+Minimize.TextSize = 16
 Minimize.Parent = Header
+Instance.new("UICorner", Minimize).CornerRadius = UDim.new(0, 6)
 
-Instance.new("UICorner", Minimize).CornerRadius = UDim.new(0, 7)
-
---// Close
 local Close = Instance.new("TextButton")
-Close.Size = UDim2.fromOffset(32, 34)
-Close.Position = UDim2.new(1, -42, 0, 9)
+Close.Size = UDim2.fromOffset(26, 28)
+Close.Position = UDim2.new(1, -34, 0, 6)
 Close.BackgroundColor3 = Color3.fromRGB(180, 55, 65)
 Close.Text = "X"
 Close.TextColor3 = Color3.new(1, 1, 1)
 Close.Font = Enum.Font.GothamBold
-Close.TextSize = 14
+Close.TextSize = 11
 Close.Parent = Header
-
-Instance.new("UICorner", Close).CornerRadius = UDim.new(0, 7)
+Instance.new("UICorner", Close).CornerRadius = UDim.new(0, 6)
 
 Close.MouseButton1Click:Connect(function()
     ScreenGui:Destroy()
 end)
 
---// Status
+--// Status (compact)
 local Status = Instance.new("TextLabel")
-Status.Position = UDim2.new(0, 12, 0, 59)
-Status.Size = UDim2.new(1, -120, 0, 30)
+Status.Position = UDim2.new(0, 8, 0, 44)
+Status.Size = UDim2.new(1, -16, 0, 16)
 Status.BackgroundTransparency = 1
 Status.Font = Enum.Font.Gotham
-Status.Text = "Monitoring players..."
+Status.Text = "Monitoring..."
 Status.TextColor3 = Color3.fromRGB(160, 175, 200)
-Status.TextSize = 11
+Status.TextSize = 9
 Status.TextXAlignment = Enum.TextXAlignment.Left
 Status.Parent = Main
 
---// Copy All
+--// Tab buttons (MY / ALL)
+local Tabs = Instance.new("Frame")
+Tabs.Position = UDim2.new(0, 8, 0, 62)
+Tabs.Size = UDim2.new(1, -16, 0, 20)
+Tabs.BackgroundTransparency = 1
+Tabs.Parent = Main
+
+local MyTab = Instance.new("TextButton")
+MyTab.Size = UDim2.fromOffset(70, 20)
+MyTab.BackgroundColor3 = Color3.fromRGB(55, 105, 190)
+MyTab.Text = "MY"
+MyTab.TextColor3 = Color3.new(1, 1, 1)
+MyTab.Font = Enum.Font.GothamBold
+MyTab.TextSize = 9
+MyTab.Parent = Tabs
+Instance.new("UICorner", MyTab).CornerRadius = UDim.new(0, 5)
+
+local AllTab = Instance.new("TextButton")
+AllTab.Size = UDim2.fromOffset(70, 20)
+AllTab.Position = UDim2.new(0, 74, 0, 0)
+AllTab.BackgroundColor3 = Color3.fromRGB(40, 50, 70)
+AllTab.Text = "ALL"
+AllTab.TextColor3 = Color3.fromRGB(200, 210, 230)
+AllTab.Font = Enum.Font.GothamBold
+AllTab.TextSize = 9
+AllTab.Parent = Tabs
+Instance.new("UICorner", AllTab).CornerRadius = UDim.new(0, 5)
+
+--// Manual input + Copy All
+local ManualBox = Instance.new("TextBox")
+ManualBox.Position = UDim2.new(0, 8, 0, 86)
+ManualBox.Size = UDim2.new(1, -110, 0, 20)
+ManualBox.BackgroundColor3 = Color3.fromRGB(35, 42, 58)
+ManualBox.TextColor3 = Color3.new(1, 1, 1)
+ManualBox.PlaceholderText = "Animation ID..."
+ManualBox.ClearTextOnFocus = false
+ManualBox.Font = Enum.Font.Gotham
+ManualBox.TextSize = 9
+ManualBox.Parent = Main
+Instance.new("UICorner", ManualBox).CornerRadius = UDim.new(0, 5)
+
+local AddBtn = Instance.new("TextButton")
+AddBtn.Position = UDim2.new(1, -100, 0, 86)
+AddBtn.Size = UDim2.fromOffset(56, 20)
+AddBtn.BackgroundColor3 = Color3.fromRGB(30, 130, 70)
+AddBtn.Text = "+ ADD"
+AddBtn.TextColor3 = Color3.new(1, 1, 1)
+AddBtn.Font = Enum.Font.GothamBold
+AddBtn.TextSize = 9
+AddBtn.Parent = Main
+Instance.new("UICorner", AddBtn).CornerRadius = UDim.new(0, 5)
+
 local CopyAll = Instance.new("TextButton")
-CopyAll.Size = UDim2.fromOffset(92, 30)
-CopyAll.Position = UDim2.new(1, -104, 0, 59)
+CopyAll.Position = UDim2.new(1, -42, 0, 86)
+CopyAll.Size = UDim2.fromOffset(34, 20)
 CopyAll.BackgroundColor3 = Color3.fromRGB(55, 105, 190)
-CopyAll.Text = "COPY ALL"
+CopyAll.Text = "CPY"
 CopyAll.TextColor3 = Color3.new(1, 1, 1)
 CopyAll.Font = Enum.Font.GothamBold
-CopyAll.TextSize = 11
+CopyAll.TextSize = 9
 CopyAll.Parent = Main
-
-Instance.new("UICorner", CopyAll).CornerRadius = UDim.new(0, 7)
+Instance.new("UICorner", CopyAll).CornerRadius = UDim.new(0, 5)
 
 --// Copy fallback
 local CopyBox = Instance.new("TextBox")
-CopyBox.Position = UDim2.new(0, 12, 0, 94)
-CopyBox.Size = UDim2.new(1, -24, 0, 30)
+CopyBox.Position = UDim2.new(0, 8, 0, 110)
+CopyBox.Size = UDim2.new(1, -16, 0, 24)
 CopyBox.BackgroundColor3 = Color3.fromRGB(35, 42, 58)
 CopyBox.TextColor3 = Color3.new(1, 1, 1)
-CopyBox.PlaceholderText = "Select text to copy manually"
+CopyBox.PlaceholderText = "Copy manually"
 CopyBox.ClearTextOnFocus = false
 CopyBox.TextEditable = true
 CopyBox.Font = Enum.Font.Gotham
-CopyBox.TextSize = 11
+CopyBox.TextSize = 9
 CopyBox.Visible = false
 CopyBox.Parent = Main
+Instance.new("UICorner", CopyBox).CornerRadius = UDim.new(0, 5)
 
-Instance.new("UICorner", CopyBox).CornerRadius = UDim.new(0, 6)
-
---// Scrolling List
+--// List
 local List = Instance.new("ScrollingFrame")
-List.Position = UDim2.new(0, 12, 0, 100)
-List.Size = UDim2.new(1, -24, 1, -146)
+List.Position = UDim2.new(0, 8, 0, 112)
+List.Size = UDim2.new(1, -16, 1, -140)
 List.BackgroundTransparency = 1
 List.BorderSizePixel = 0
-List.ScrollBarThickness = 4
+List.ScrollBarThickness = 3
 List.AutomaticCanvasSize = Enum.AutomaticSize.Y
 List.CanvasSize = UDim2.new(0, 0, 0, 0)
 List.Parent = Main
 
 local Layout = Instance.new("UIListLayout")
-Layout.Padding = UDim.new(0, 8)
+Layout.Padding = UDim.new(0, 5)
 Layout.SortOrder = Enum.SortOrder.LayoutOrder
 Layout.Parent = List
 
 local Padding = Instance.new("UIPadding")
-Padding.PaddingTop = UDim.new(0, 3)
-Padding.PaddingBottom = UDim.new(0, 5)
+Padding.PaddingTop = UDim.new(0, 2)
+Padding.PaddingBottom = UDim.new(0, 3)
 Padding.Parent = List
 
 local Empty = Instance.new("TextLabel")
-Empty.Size = UDim2.new(1, 0, 0, 60)
+Empty.Size = UDim2.new(1, 0, 0, 40)
 Empty.BackgroundTransparency = 1
 Empty.Text = "No animations detected yet..."
 Empty.TextColor3 = Color3.fromRGB(130, 140, 160)
 Empty.Font = Enum.Font.Gotham
-Empty.TextSize = 12
+Empty.TextSize = 10
 Empty.Parent = List
 
 --// Footer
 local Footer = Instance.new("TextLabel")
-Footer.Position = UDim2.new(0, 12, 1, -35)
-Footer.Size = UDim2.new(1, -24, 0, 25)
+Footer.Position = UDim2.new(0, 8, 1, -24)
+Footer.Size = UDim2.new(1, -16, 0, 20)
 Footer.BackgroundTransparency = 1
-Footer.Text = "Unique: 0 | Steals: 0 | Plays: 0"
+Footer.Text = "U:0 | S:0 | P:0"
 Footer.TextColor3 = Color3.fromRGB(130, 145, 175)
 Footer.Font = Enum.Font.Gotham
-Footer.TextSize = 11
+Footer.TextSize = 9
 Footer.TextXAlignment = Enum.TextXAlignment.Left
 Footer.Parent = Main
 
---// Minimize system
+--// View mode
+local viewMode = "all"  -- "my" | "all"
+
+local function applyFilter()
+    for _, entry in ipairs(entries) do
+        if viewMode == "all" then
+            entry.row.Visible = true
+        else
+            entry.row.Visible = entry.owner == LocalPlayer
+        end
+    end
+end
+
+local function setTabActive(btn, active)
+    btn.BackgroundColor3 = active
+        and Color3.fromRGB(55, 105, 190)
+        or Color3.fromRGB(40, 50, 70)
+    btn.TextColor3 = active
+        and Color3.new(1, 1, 1)
+        or Color3.fromRGB(200, 210, 230)
+end
+
+MyTab.MouseButton1Click:Connect(function()
+    viewMode = "my"
+    setTabActive(MyTab, true)
+    setTabActive(AllTab, false)
+    applyFilter()
+end)
+
+AllTab.MouseButton1Click:Connect(function()
+    viewMode = "all"
+    setTabActive(MyTab, false)
+    setTabActive(AllTab, true)
+    applyFilter()
+end)
+
+--// Minimize
 local function setMinimized(value)
     minimized = value
-
     if minimized then
-        Main.Size = UDim2.new(0.9, 0, 0, 52)
+        Main.Size = UDim2.new(0, 440, 0, 40)
         Minimize.Text = "+"
     else
         Main.Size = ExpandedSize
         Minimize.Text = "−"
     end
-
-    Status.Visible = not minimized
-    CopyAll.Visible = not minimized
-    List.Visible = not minimized
-    Footer.Visible = not minimized
-    CopyBox.Visible = copyBoxActive and not minimized
+    Status.Visible     = not minimized
+    CopyAll.Visible    = not minimized
+    List.Visible       = not minimized
+    Footer.Visible     = not minimized
+    ManualBox.Visible  = not minimized
+    AddBtn.Visible     = not minimized
+    Tabs.Visible       = not minimized
+    CopyBox.Visible    = copyBoxActive and not minimized
 end
 
 Minimize.MouseButton1Click:Connect(function()
@@ -304,25 +395,17 @@ end)
 --// Clipboard
 local function copyText(value)
     local clipboard
-
-    pcall(function()
-        clipboard = setclipboard
-    end)
-
+    pcall(function() clipboard = setclipboard end)
     if typeof(clipboard) == "function" then
-        local success = pcall(clipboard, value)
-
-        if success then
-            Status.Text = "Copied successfully!"
+        if pcall(clipboard, value) then
+            Status.Text = "Copied!"
             return
         end
     end
-
     copyBoxActive = true
     CopyBox.Text = value
     CopyBox.Visible = not minimized
-    Status.Text = "Select the text to copy manually"
-
+    Status.Text = "Select text manually"
     if not minimized then
         CopyBox:CaptureFocus()
         CopyBox.CursorPosition = #value + 1
@@ -333,50 +416,31 @@ end
 --// Update stats
 local function updateStats()
     Empty.Visible = #entries == 0
-
-    Footer.Text = string.format(
-        "Unique: %d | Steals: %d | Plays: %d",
-        #entries,
-        stealCount,
-        totalPlays
-    )
-
+    Footer.Text = string.format("U:%d | S:%d | P:%d", #entries, stealCount, totalPlays)
+    StealBadge.Visible = stealCount > 0
     if stealCount > 0 then
-        StealBadge.Visible = true
         StealText.Text = "STEAL x" .. stealCount
-    else
-        StealBadge.Visible = false
     end
 end
 
---// Add player to entry
+--// Add user
 local function addUser(entry, player)
-    if entry.userSet[player.UserId] then
-        return
-    end
-
+    if entry.userSet[player.UserId] then return end
     entry.userSet[player.UserId] = true
-
-    table.insert(
-        entry.users,
-        player.DisplayName .. " (@" .. player.Name .. ")"
-    )
-
-    entry.playersLabel.Text =
-        "Players (" .. #entry.users .. "): " ..
+    table.insert(entry.users, player.DisplayName .. " (@" .. player.Name .. ")")
+    entry.playersLabel.Text = "P (" .. #entry.users .. "): " ..
         table.concat(entry.users, ", ")
 end
 
---// แจ้งเตือนจุดเขียวแบบชั่วคราวบนหน้าจอ (toast)
+--// Toast
 local function stealToast(playerName, animName, id)
     local toast = Instance.new("Frame")
-    toast.Size = UDim2.fromOffset(300, 56)
-    toast.Position = UDim2.new(0.5, -150, 0, -80)
+    toast.Size = UDim2.fromOffset(280, 48)
+    toast.Position = UDim2.new(0.5, -140, 0, -60)
     toast.BackgroundColor3 = Color3.fromRGB(14, 40, 24)
     toast.BorderSizePixel = 0
     toast.Parent = ScreenGui
-
-    Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 10)
+    Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 8)
 
     local ts = Instance.new("UIStroke")
     ts.Color = Color3.fromRGB(60, 255, 120)
@@ -384,66 +448,90 @@ local function stealToast(playerName, animName, id)
     ts.Parent = toast
 
     local dot = Instance.new("Frame")
-    dot.Size = UDim2.fromOffset(12, 12)
-    dot.Position = UDim2.new(0, 12, 0.5, -6)
+    dot.Size = UDim2.fromOffset(10, 10)
+    dot.Position = UDim2.new(0, 10, 0.5, -5)
     dot.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
     dot.Parent = toast
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
     local title = Instance.new("TextLabel")
-    title.Position = UDim2.new(0, 32, 0, 8)
-    title.Size = UDim2.new(1, -40, 0, 18)
+    title.Position = UDim2.new(0, 26, 0, 5)
+    title.Size = UDim2.new(1, -34, 0, 16)
     title.BackgroundTransparency = 1
-    title.Text = "STEAL DETECTED — " .. playerName
+    title.Text = "STEAL — " .. playerName
     title.TextColor3 = Color3.fromRGB(60, 255, 120)
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 12
+    title.TextSize = 10
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = toast
 
-    local sub = Instance.new("TextLabel")
-    sub.Position = UDim2.new(0, 32, 0, 28)
-    sub.Size = UDim2.new(1, -40, 0, 20)
-    sub.BackgroundTransparency = 1
-    sub.Text = animName .. " [" .. id .. "]"
-    sub.TextColor3 = Color3.fromRGB(200, 230, 210)
-    sub.Font = Enum.Font.Gotham
-    sub.TextSize = 10
-    sub.TextXAlignment = Enum.TextXAlignment.Left
-    sub.TextTruncate = Enum.TextTruncate.AtEnd
-    sub.Parent = toast
+    local sub2 = Instance.new("TextLabel")
+    sub2.Position = UDim2.new(0, 26, 0, 22)
+    sub2.Size = UDim2.new(1, -34, 0, 16)
+    sub2.BackgroundTransparency = 1
+    sub2.Text = animName .. " [" .. id .. "]"
+    sub2.TextColor3 = Color3.fromRGB(200, 230, 210)
+    sub2.Font = Enum.Font.Gotham
+    sub2.TextSize = 9
+    sub2.TextXAlignment = Enum.TextXAlignment.Left
+    sub2.TextTruncate = Enum.TextTruncate.AtEnd
+    sub2.Parent = toast
 
-    TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0.5, -150, 0, 12)
+    TweenService:Create(toast, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0.5, -140, 0, 10)
     }):Play()
 
-    task.delay(2.5, function()
-        local t = TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-            Position = UDim2.new(0.5, -150, 0, -80)
+    task.delay(2.2, function()
+        local t = TweenService:Create(toast, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5, -140, 0, -60)
         })
         t:Play()
-        t.Completed:Once(function()
-            toast:Destroy()
-        end)
+        t.Completed:Once(function() toast:Destroy() end)
     end)
 end
 
---// Detect animation
+--// Mark as steal
+local function markEntryAsSteal(entry, normalizedID)
+    if entry.isSteal then return end
+    entry.isSteal = true
+    entry.category = "steal"
+    learnedStealIDs[normalizedID] = { name = entry.name, markedAt = tick() }
+    saveLearned()
+    stealCount += 1
+    updateStats()
+    stealToast("(marked)", entry.name, entry.id)
+    Status.Text = "Marked STEAL: " .. entry.name
+    Status.TextColor3 = Color3.fromRGB(60, 255, 120)
+    entry.row.BackgroundColor3 = Color3.fromRGB(18, 45, 28)
+    entry.rowStroke.Color = Color3.fromRGB(60, 255, 120)
+    entry.rowStroke.Thickness = 2
+    entry.nameLabel.TextColor3 = Color3.fromRGB(120, 255, 160)
+    if not entry.accent then
+        local accent = Instance.new("Frame")
+        accent.Size = UDim2.new(0, 3, 1, 0)
+        accent.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
+        accent.BorderSizePixel = 0
+        accent.Parent = entry.row
+        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 8)
+        entry.accent = accent
+    end
+    entry.markBtn.Text = "✓ STEAL"
+    entry.markBtn.BackgroundColor3 = Color3.fromRGB(30, 130, 70)
+    entry.row.LayoutOrder = -100000 - #entries
+end
+
+--// Detect (now records owner!)
 local function detectAnimation(player, track)
     if not ScreenGui.Parent then return end
     if not player or not track then return end
 
-    -- กันนับ Plays ซ้ำ (track เดียวกัน)
-    local alreadyCounted = seenTracks[track]
-    if not alreadyCounted then
+    if not seenTracks[track] then
         seenTracks[track] = true
         totalPlays += 1
     end
 
     local animation
-    pcall(function()
-        animation = track.Animation
-    end)
+    pcall(function() animation = track.Animation end)
     if not animation then return end
 
     local id = animation.AnimationId
@@ -460,127 +548,129 @@ local function detectAnimation(player, track)
         name = track.Name
     end
     if not name or name == "" or name == "Animation" then
-        name = "Unnamed Animation"
+        name = "Unnamed"
     end
 
-    -- จำแนกประเภท
-    local category = classify(track, animation, name, id)
-    local isSteal = category == "steal"
+    local category = classify(track, name, id, normalizedID)
+    local isSteal = (category == "steal")
+    local isMine = (player == LocalPlayer)
 
-    -- ถ้าเป็น steal และยังไม่เคยเจอ ID นี้ → แจ้งเตือนจุดเขียว
     if isSteal and not entryMap[normalizedID] then
         stealCount += 1
         stealToast(player.DisplayName, name, id)
-        Status.Text = "⚠ STEAL DETECTED: " .. name
+        Status.Text = "🟢 STEAL: " .. name
         Status.TextColor3 = Color3.fromRGB(60, 255, 120)
         task.delay(3, function()
             if Status.Text:find("STEAL") then
-                Status.Text = "Monitoring players..."
+                Status.Text = "Monitoring..."
                 Status.TextColor3 = Color3.fromRGB(160, 175, 200)
             end
         end)
     end
 
-    -- Same ID = same entry globally
     local existing = entryMap[normalizedID]
-
     if existing then
         existing.plays += 1
         addUser(existing, player)
-
-        existing.info.Text =
-            "ID: " .. existing.id ..
-            " | Plays: " .. existing.plays ..
+        existing.info.Text = "ID: " .. existing.id ..
+            " | P: " .. existing.plays ..
             " | " .. existing.category
-
-        updateStats()
+        -- ถ้าเป็นของเราเอง และ entry เดิม owned by others
+        if isMine and existing.owner ~= LocalPlayer then
+            existing.owner = LocalPlayer
+            existing.nameLabel.Text = (existing.isSteal and "🟢 " or "★ ") ..
+                "MINE: " .. existing.name
+        end
+        applyFilter()
         return
     end
 
-    -- New unique animation
+    -- สร้าง row ใหม่ (78px)
     local row = Instance.new("Frame")
-    row.Name = "AnimationEntry"
-    row.Size = UDim2.new(1, -5, 0, 92)
+    row.Size = UDim2.new(1, -3, 0, 78)
     row.BackgroundColor3 = isSteal
-        and Color3.fromRGB(18, 45, 28)   -- พื้นเขียวอ่อนสำหรับ steal
+        and Color3.fromRGB(18, 45, 28)
         or Color3.fromRGB(30, 36, 50)
     row.BorderSizePixel = 0
-    -- steal ขึ้นบนสุดเสมอ
-    row.LayoutOrder = isSteal and -100000 - #entries or -#entries - 1
+    row.LayoutOrder = isSteal and (-100000 - #entries) or (-#entries - 1)
     row.Parent = List
-
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
     local rowStroke = Instance.new("UIStroke")
-    rowStroke.Color = isSteal and Color3.fromRGB(60, 255, 120) or Color3.fromRGB(55, 67, 90)
+    rowStroke.Color = isSteal
+        and Color3.fromRGB(60, 255, 120)
+        or Color3.fromRGB(55, 67, 90)
     rowStroke.Thickness = isSteal and 2 or 1
     rowStroke.Parent = row
 
-    -- แถบสีด้านซ้ายสำหรับ steal
-    if isSteal then
-        local accent = Instance.new("Frame")
-        accent.Size = UDim2.new(0, 4, 1, 0)
-        accent.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
-        accent.BorderSizePixel = 0
-        accent.Parent = row
-        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 8)
-    end
-
-    -- Animation name (พร้อมจุดเขียวถ้าเป็น steal)
+    -- Name (แสดง MINE ถ้าเป็นของเรา)
+    local prefix = isSteal and "🟢 " or (isMine and "★ " or "")
+    local displayName = isMine and ("MINE: " .. name) or name
     local nameLabel = Instance.new("TextLabel")
-    nameLabel.Position = UDim2.new(0, isSteal and 18 or 9, 0, 5)
-    nameLabel.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 19)
+    nameLabel.Position = UDim2.new(0, 7, 0, 3)
+    nameLabel.Size = UDim2.new(1, -80, 0, 16)
     nameLabel.BackgroundTransparency = 1
-    nameLabel.Text = (isSteal and "🟢 " or "") .. "Animation: " .. name
+    nameLabel.Text = prefix .. displayName
     nameLabel.TextColor3 = isSteal
         and Color3.fromRGB(120, 255, 160)
-        or Color3.fromRGB(225, 235, 255)
+        or (isMine and Color3.fromRGB(255, 220, 120)
+            or Color3.fromRGB(225, 235, 255))
     nameLabel.Font = Enum.Font.GothamBold
-    nameLabel.TextSize = 11
+    nameLabel.TextSize = 9
     nameLabel.TextXAlignment = Enum.TextXAlignment.Left
     nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
     nameLabel.Parent = row
 
-    -- Players
+    -- Players (compact)
     local playersLabel = Instance.new("TextLabel")
-    playersLabel.Position = UDim2.new(0, isSteal and 18 or 9, 0, 26)
-    playersLabel.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 24)
+    playersLabel.Position = UDim2.new(0, 7, 0, 20)
+    playersLabel.Size = UDim2.new(1, -80, 0, 16)
     playersLabel.BackgroundTransparency = 1
     playersLabel.TextColor3 = Color3.fromRGB(145, 165, 200)
     playersLabel.Font = Enum.Font.Gotham
-    playersLabel.TextSize = 9
+    playersLabel.TextSize = 8
     playersLabel.TextXAlignment = Enum.TextXAlignment.Left
-    playersLabel.TextYAlignment = Enum.TextYAlignment.Top
     playersLabel.TextWrapped = true
     playersLabel.Parent = row
 
-    -- ID + Plays + Category
+    -- Info
     local info = Instance.new("TextLabel")
-    info.Position = UDim2.new(0, isSteal and 18 or 9, 0, 57)
-    info.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 25)
+    info.Position = UDim2.new(0, 7, 0, 38)
+    info.Size = UDim2.new(1, -80, 0, 14)
     info.BackgroundTransparency = 1
-    info.Text = "ID: " .. id .. " | Plays: 1 | " .. category
+    info.Text = "ID: " .. id .. " | P: 1 | " .. category
     info.TextColor3 = Color3.fromRGB(145, 165, 200)
     info.Font = Enum.Font.Gotham
-    info.TextSize = 9
+    info.TextSize = 8
     info.TextXAlignment = Enum.TextXAlignment.Left
     info.TextTruncate = Enum.TextTruncate.AtEnd
     info.Parent = row
 
-    -- Copy ID
-    local Copy = Instance.new("TextButton")
-    Copy.Size = UDim2.fromOffset(78, 30)
-    Copy.Position = UDim2.new(1, -87, 0.5, -15)
-    Copy.BackgroundColor3 = isSteal
+    -- Mark Steal (64×20)
+    local markBtn = Instance.new("TextButton")
+    markBtn.Size = UDim2.fromOffset(64, 20)
+    markBtn.Position = UDim2.new(0, 7, 0, 54)
+    markBtn.BackgroundColor3 = isSteal
         and Color3.fromRGB(30, 130, 70)
-        or Color3.fromRGB(50, 105, 175)
-    Copy.Text = "COPY ID"
+        or Color3.fromRGB(60, 80, 110)
+    markBtn.Text = isSteal and "✓ STEAL" or "MARK"
+    markBtn.TextColor3 = Color3.new(1, 1, 1)
+    markBtn.Font = Enum.Font.GothamBold
+    markBtn.TextSize = 8
+    markBtn.Parent = row
+    Instance.new("UICorner", markBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Copy (64×20)
+    local Copy = Instance.new("TextButton")
+    Copy.Size = UDim2.fromOffset(48, 20)
+    Copy.Position = UDim2.new(0, 73, 0, 54)
+    Copy.BackgroundColor3 = Color3.fromRGB(50, 105, 175)
+    Copy.Text = "COPY"
     Copy.TextColor3 = Color3.new(1, 1, 1)
     Copy.Font = Enum.Font.GothamBold
-    Copy.TextSize = 10
+    Copy.TextSize = 8
     Copy.Parent = row
-
-    Instance.new("UICorner", Copy).CornerRadius = UDim.new(0, 6)
+    Instance.new("UICorner", Copy).CornerRadius = UDim.new(0, 4)
 
     local entry = {
         id = id,
@@ -588,31 +678,80 @@ local function detectAnimation(player, track)
         plays = 1,
         category = category,
         isSteal = isSteal,
+        owner = player,
         users = {},
         userSet = {},
         playersLabel = playersLabel,
-        info = info
+        info = info,
+        row = row,
+        rowStroke = rowStroke,
+        nameLabel = nameLabel,
+        markBtn = markBtn,
+        accent = nil,
+        normalizedID = normalizedID,
     }
+
+    if isSteal then
+        local accent = Instance.new("Frame")
+        accent.Size = UDim2.new(0, 3, 1, 0)
+        accent.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
+        accent.BorderSizePixel = 0
+        accent.Parent = row
+        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 8)
+        entry.accent = accent
+    end
 
     entryMap[normalizedID] = entry
     table.insert(entries, entry)
-
     addUser(entry, player)
 
     Copy.MouseButton1Click:Connect(function()
         copyText(id)
     end)
 
+    markBtn.MouseButton1Click:Connect(function()
+        markEntryAsSteal(entry, normalizedID)
+    end)
+
     updateStats()
+    applyFilter()
 
     if isSteal then
-        Status.Text = "🟢 New STEAL animation detected!"
+        Status.Text = "🟢 New STEAL!"
         Status.TextColor3 = Color3.fromRGB(60, 255, 120)
     else
-        Status.Text = "New unique animation detected!"
-        Status.TextColor3 = Color3.fromRGB(160, 175, 200)
+        Status.Text = isMine and "New MINE animation!" or "New animation!"
+        Status.TextColor3 = isMine
+            and Color3.fromRGB(255, 220, 120)
+            or Color3.fromRGB(160, 175, 200)
     end
 end
+
+--// Manual add
+AddBtn.MouseButton1Click:Connect(function()
+    local raw = ManualBox.Text:gsub("%s+", "")
+    if raw == "" then
+        Status.Text = "ใส่ ID ก่อน"
+        return
+    end
+    local normalized =
+        raw:match("[?&]id=(%d+)")
+        or raw:match("rbxassetid://(%d+)")
+        or raw:match("(%d+)$")
+        or raw
+
+    manualStealIDs[normalized] = "manual"
+    saveLearned()
+    ManualBox.Text = ""
+
+    local entry = entryMap[normalized]
+    if entry then
+        markEntryAsSteal(entry, normalized)
+    else
+        Status.Text = "Added ID: " .. normalized
+        Status.TextColor3 = Color3.fromRGB(60, 255, 120)
+    end
+end)
 
 --// Copy all
 CopyAll.MouseButton1Click:Connect(function()
@@ -620,10 +759,7 @@ CopyAll.MouseButton1Click:Connect(function()
         Status.Text = "Nothing to copy!"
         return
     end
-
-    local steals = {}
-    local others = {}
-
+    local steals, mine, others = {}, {}, {}
     for _, entry in ipairs(entries) do
         local block =
             "Animation: " .. entry.name ..
@@ -631,55 +767,50 @@ CopyAll.MouseButton1Click:Connect(function()
             "\nCategory: " .. entry.category ..
             "\nPlayers: " .. table.concat(entry.users, ", ") ..
             "\nPlays: " .. entry.plays
-
         if entry.isSteal then
             table.insert(steals, block)
+        elseif entry.owner == LocalPlayer then
+            table.insert(mine, block)
         else
             table.insert(others, block)
         end
     end
-
     local output = {}
-
     if #steals > 0 then
-        table.insert(output, "=== STEAL ANIMATIONS (" .. #steals .. ") ===")
+        table.insert(output, "=== STEAL (" .. #steals .. ") ===")
         table.insert(output, table.concat(steals, "\n\n"))
     end
-
+    if #mine > 0 then
+        table.insert(output, "=== MY ANIMATIONS (" .. #mine .. ") ===")
+        table.insert(output, table.concat(mine, "\n\n"))
+    end
     if #others > 0 then
-        table.insert(output, "=== OTHER ANIMATIONS (" .. #others .. ") ===")
+        table.insert(output, "=== OTHERS (" .. #others .. ") ===")
         table.insert(output, table.concat(others, "\n\n"))
     end
-
     copyText(table.concat(output, "\n\n"))
 end)
 
---// Watch animator
+--// Watch
 local function watchAnimator(animator, player)
     if monitored[animator] then return end
     monitored[animator] = true
-
     animator.AnimationPlayed:Connect(function(track)
         detectAnimation(player, track)
     end)
-
     for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
         detectAnimation(player, track)
     end
 end
 
---// Watch character
 local function watchCharacter(player, character)
     if not character then return end
-
     local function check(obj)
         if obj:IsA("Animator") then
             watchAnimator(obj, player)
         end
     end
-
     character.DescendantAdded:Connect(check)
-
     for _, obj in ipairs(character:GetDescendants()) do
         check(obj)
     end
@@ -689,7 +820,6 @@ local function watchPlayer(player)
     player.CharacterAdded:Connect(function(character)
         watchCharacter(player, character)
     end)
-
     if player.Character then
         watchCharacter(player, player.Character)
     end
@@ -702,9 +832,7 @@ Players.PlayerAdded:Connect(watchPlayer)
 
 --// Draggable
 local dragging = false
-local dragStart
-local startPosition
-
+local dragStart, startPosition
 Header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -713,7 +841,6 @@ Header.InputBegan:Connect(function(input)
         startPosition = Main.Position
     end
 end)
-
 UIS.InputChanged:Connect(function(input)
     if dragging and (
         input.UserInputType == Enum.UserInputType.MouseMovement
@@ -728,7 +855,6 @@ UIS.InputChanged:Connect(function(input)
         )
     end
 end)
-
 UIS.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -737,5 +863,5 @@ UIS.InputEnded:Connect(function(input)
 end)
 
 updateStats()
-
-print("[Animation Detector V3] Loaded with Steal Detection!")
+setTabActive(AllTab, true)
+print("[Animation Detector V5] Loaded — compact + self-tracking")

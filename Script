@@ -1,495 +1,741 @@
---[[ Bug Evolution — Magnet XP Farm (Rayfield) ]]
+--// PLAYER ANIMATION DETECTOR V3
+--// เน้นตรวจ Steal Animation + แจ้งเตือนจุดเขียว
+--// LocalScript | StarterPlayerScripts
 
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
 
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local CollectionService = game:GetService("CollectionService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local monitored = setmetatable({}, {__mode = "k"})
+local entryMap = {}
+local entries = {}
+local seenTracks = setmetatable({}, {__mode = "k"})  -- กันนับ Plays ซ้ำ
 
-local LP          = Players.LocalPlayer
-local Remotes     = ReplicatedStorage:WaitForChild("Remotes")
-local SpiderDefs  = require(ReplicatedStorage.Shared.SpiderDefs)
-local Stages      = require(ReplicatedStorage.Shared.Stages)
+local totalPlays = 0
+local stealCount = 0
+local minimized = false
+local copyBoxActive = false
 
--- ============================================================
--- STATE
--- ============================================================
-local State = {
-    Enabled     = false,
-    Speed       = 60,      -- TP/วินาที
-    Range       = 600,     -- studs
-    HitboxSize  = 20,      -- ขนาด hitbox ดูด orb
-    UseHitbox   = true,    -- ใช้ hitbox รวบกลุ่ม orb
-    AutoEvolve  = false,
-    AutoSprint  = true,
-    KillBugs    = false,
-    LastAttack  = 0,
-    LastEvolve  = 0,
-    LastSprint  = 0,
-    Status      = "idle",
-    MagnetPart  = nil,
-    Running     = false,
-    LastPos     = nil,
-    StuckT      = 0,
+local ExpandedSize = UDim2.new(0.9, 0, 0.72, 0)
+
+--// ====== KNOWLEDGE BASE ======
+-- เก็บ keyword ที่บ่งบอกว่าเป็น steal animation
+-- เพิ่มเติมได้เรื่อยๆ เมื่อเจอ animation ใหม่
+local STEAL_KEYWORDS = {
+    "steal", "stealing", "snatch", "tackle", "intercept",
+    "strips", "stripping", "dispossess", "takeball", "take ball",
+    "taketheball", "balltake", "ballsnatch", "predator", "ravenous",
+    "shadowstrike", "silentsteal", "silent steal", "survivalinstinct",
+    "predatory", "snatcher", "pickpocket", "larceny"
 }
 
--- ============================================================
--- HELPERS
--- ============================================================
-local function char()  return LP.Character end
-local function hum()   local c=char(); return c and c:FindFirstChildOfClass("Humanoid") end
-local function root()  local c=char(); return c and c:FindFirstChild("HumanoidRootPart") end
+-- keyword ที่บอกว่าเป็นทักษะอื่น (เพื่อไม่ให้สับสน)
+local OTHER_KEYWORDS = {
+    tackle = { "tackle", "slide", "slidetackle", "slide tackle" },
+    dribble = { "dribble", "dribbling", "feint", "stepover", "roulette" },
+    shoot = { "shoot", "shot", "kick", "volley", "shotpower", "finisher" },
+    skill   = { "skill", "technique", "special", "ult", "flow", "awaken" }
+}
 
-local function alive()
-    local h = hum()
-    return h ~= nil and h.Health > 0 and LP:GetAttribute("Alive") == true
-end
+local function classify(track, animation, name, id)
+    local lowerName = string.lower(name or "")
+    local lowerId = string.lower(id or "")
 
-local function blocked()
-    if LP:GetAttribute("InTutorial")   then return true end
-    if LP:GetAttribute("Transforming") then return true end
-    local c = char()
-    if c and c:GetAttribute("SelfRoot") then return true end
-    local h = hum()
-    if h and h:GetAttribute("Stunned") then return true end
-    return false
-end
-
--- ============================================================
--- ORB FINDER
--- ============================================================
-local function getOrbsSorted(maxRange)
-    local folder = workspace:FindFirstChild("Orbs")
-    if not folder then return {} end
-    local r = root(); if not r then return {} end
-
-    local list = {}
-    for _, o in folder:GetChildren() do
-        if not o:IsA("BasePart") then continue end
-        if o:GetAttribute("BurstFrom") then continue end
-        local d = (o.Position - r.Position).Magnitude
-        if d <= maxRange then
-            table.insert(list, { orb = o, pos = o.Position, dist = d })
+    -- 1. เช็ค keyword steal ก่อน (ให้ความสำคัญสูงสุด)
+    for _, kw in ipairs(STEAL_KEYWORDS) do
+        if lowerName:find(kw, 1, true) or lowerId:find(kw, 1, true) then
+            return "steal"
         end
     end
-    table.sort(list, function(a, b) return a.dist < b.dist end)
-    return list
-end
 
--- จัดกลุ่ม orb ที่อยู่ใกล้กัน
-local function clusterOrbs(orbs, radius)
-    local clusters, used = {}, {}
-    for i = 1, #orbs do
-        if used[i] then continue end
-        used[i] = true
-        local c = { center = orbs[i].pos, count = 1, orbs = { orbs[i].orb } }
-        for j = i + 1, #orbs do
-            if used[j] then continue end
-            if (orbs[i].pos - orbs[j].pos).Magnitude <= radius then
-                used[j] = true
-                c.center = c.center + orbs[j].pos
-                c.count  = c.count + 1
-                table.insert(c.orbs, orbs[j].orb)
+    -- 2. เช็ค keyword อื่น
+    for category, keywords in pairs(OTHER_KEYWORDS) do
+        for _, kw in ipairs(keywords) do
+            if lowerName:find(kw, 1, true) then
+                return category
             end
         end
-        c.center = c.center / c.count
-        table.insert(clusters, c)
-    end
-    return clusters
-end
-
--- ============================================================
--- MAGNET HITBOX (ขยายขอบเขตดูด orb)
--- ============================================================
-local function setupMagnetPart()
-    if State.MagnetPart and State.MagnetPart.Parent then
-        State.MagnetPart:Destroy()
     end
 
-    local c, r = char(), root()
-    if not (c and r) then return end
-
-    local part = Instance.new("Part")
-    part.Name          = "MagnetHitbox"
-    part.Size          = Vector3.new(State.HitboxSize, State.HitboxSize, State.HitboxSize)
-    part.Transparency  = 1
-    part.CanCollide    = false
-    part.CanQuery      = false
-    part.CanTouch      = true      -- สำคัญ! ให้ Touched ทำงาน
-    part.Anchored      = true
-    part.Massless      = true
-    part.CFrame        = r.CFrame
-    part.Parent        = c         -- เป็น descendant ของ character
-
-    State.MagnetPart = part
-
-    -- ให้ตาม player
-    RunService.Heartbeat:Connect(function()
-        if part.Parent and r.Parent then
-            part.CFrame = r.CFrame
-        end
+    -- 3. ถ้า priority เป็น Core = animation เดิน/วิ่ง/idle ของ Roblox
+    local ok, priority = pcall(function()
+        return track.Priority
     end)
-end
-
-local function updateMagnetPartSize()
-    if State.MagnetPart and State.MagnetPart.Parent then
-        State.MagnetPart.Size = Vector3.new(State.HitboxSize, State.HitboxSize, State.HitboxSize)
+    if ok and priority == Enum.AnimationPriority.Core then
+        return "core"
     end
+
+    -- 4. ค่าเริ่มต้น
+    return "other"
 end
 
-local function removeMagnetPart()
-    if State.MagnetPart and State.MagnetPart.Parent then
-        State.MagnetPart:Destroy()
-    end
-    State.MagnetPart = nil
-end
+--// ====== GUI ======
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "PlayerAnimationDetector"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 200
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
--- ============================================================
--- ACTIONS
--- ============================================================
-local function doAttack(target)
-    local now = os.clock()
-    local aspd = (LP:GetAttribute("AttackSpeed") or 1) * (LP:GetAttribute("AttackSpeedMult") or 1)
-    local cd = 1 / math.max(aspd, 0.1)
-    if now - State.LastAttack < cd then return end
-    State.LastAttack = now
-    pcall(function() Remotes.Attack:FireServer(target) end)
-end
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = ExpandedSize
+Main.Position = UDim2.fromScale(0.5, 0.5)
+Main.AnchorPoint = Vector2.new(0.5, 0.5)
+Main.BackgroundColor3 = Color3.fromRGB(19, 22, 31)
+Main.BorderSizePixel = 0
+Main.Parent = ScreenGui
 
-local function doEvolve()
-    if not State.AutoEvolve then return end
-    if LP:GetAttribute("InVoidFight") then return end
-    if LP:GetAttribute("AutoEvolveAt") then return end
-    local spiderId = LP:GetAttribute("SpiderId") or ""
-    local spider = SpiderDefs[spiderId]; if not spider then return end
-    local stage  = LP:GetAttribute("Stage") or 1
-    local level  = LP:GetAttribute("Level") or 1
-    if Stages.Next(spider, stage, level) and os.clock() - State.LastEvolve > 1.5 then
-        State.LastEvolve = os.clock()
-        pcall(function() Remotes.Evolve:InvokeServer() end)
-    end
-end
+local constraint = Instance.new("UISizeConstraint")
+constraint.MinSize = Vector2.new(280, 52)
+constraint.MaxSize = Vector2.new(600, 560)
+constraint.Parent = Main
 
-local function doSprint()
-    if not State.AutoSprint then return end
-    if LP:GetAttribute("Exhausted") then return end
-    if LP:GetAttribute("AlwaysSprint") then return end
-    if os.clock() - State.LastSprint < 1 then return end
-    State.LastSprint = os.clock()
-    pcall(function() Remotes.SetSprint:FireServer(true) end)
-end
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 12)
 
-local function canTarget(t)
-    if not t or not t.Parent then return false end
-    if t == char() then return false end
-    if t:GetAttribute("OwnerId") == LP.UserId then return false end
-    if t:GetAttribute("Boss") then return false end
-    if t:GetAttribute("IsPlayer") then return false end
-    local h = t:FindFirstChildOfClass("Humanoid")
-    if h then
-        if h.Health <= 0 then return false end
-    elseif (t:GetAttribute("HP") or 0) <= 0 then
-        return false
-    end
-    return true
-end
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(65, 75, 100)
+stroke.Thickness = 1
+stroke.Parent = Main
 
-local function findNearestBug(maxRange)
-    local r = root(); if not r then return nil end
-    local best, bestD = nil, maxRange
-    for _, c in CollectionService:GetTagged("Creature") do
-        if not c.Parent then continue end
-        if c:GetAttribute("Kind") ~= "Bug" then continue end
-        if c:GetAttribute("Corpse") then continue end
-        if not canTarget(c) then continue end
-        local hrp = c:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local d = (hrp.Position - r.Position).Magnitude
-            if d < bestD then best, bestD = c, d end
+--// Header
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 52)
+Header.BackgroundColor3 = Color3.fromRGB(29, 34, 48)
+Header.BorderSizePixel = 0
+Header.Parent = Main
+
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 12)
+
+local Title = Instance.new("TextLabel")
+Title.Position = UDim2.new(0, 12, 0, 0)
+Title.Size = UDim2.new(1, -100, 1, 0)
+Title.BackgroundTransparency = 1
+Title.Font = Enum.Font.GothamBold
+Title.Text = "PLAYER ANIMATION DETECTOR V3"
+Title.TextColor3 = Color3.fromRGB(235, 240, 255)
+Title.TextSize = 13
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+--// Steal Badge (จุดเขียว)
+local StealBadge = Instance.new("Frame")
+StealBadge.Size = UDim2.fromOffset(70, 22)
+StealBadge.Position = UDim2.new(1, -158, 0, 15)
+StealBadge.BackgroundColor3 = Color3.fromRGB(20, 80, 45)
+StealBadge.Visible = false
+StealBadge.Parent = Header
+
+Instance.new("UICorner", StealBadge).CornerRadius = UDim.new(0, 11)
+
+local StealDot = Instance.new("Frame")
+StealDot.Size = UDim2.fromOffset(8, 8)
+StealDot.Position = UDim2.new(0, 8, 0.5, -4)
+StealDot.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
+StealDot.Parent = StealBadge
+
+Instance.new("UICorner", StealDot).CornerRadius = UDim.new(1, 0)
+
+-- pulse animation ของจุดเขียว
+task.spawn(function()
+    while true do
+        if not StealBadge.Parent then break end
+        if StealBadge.Visible then
+            TweenService:Create(StealDot, TweenInfo.new(0.6, Enum.EasingStyle.Sine), {
+                BackgroundTransparency = 0.6
+            }):Play()
+            task.wait(0.6)
+            TweenService:Create(StealDot, TweenInfo.new(0.6, Enum.EasingStyle.Sine), {
+                BackgroundTransparency = 0
+            }):Play()
+            task.wait(0.6)
+        else
+            task.wait(0.3)
         end
     end
-    return best
+end)
+
+local StealText = Instance.new("TextLabel")
+StealText.Size = UDim2.new(1, -22, 1, 0)
+StealText.Position = UDim2.new(0, 20, 0, 0)
+StealText.BackgroundTransparency = 1
+StealText.Text = "STEAL"
+StealText.TextColor3 = Color3.fromRGB(60, 255, 120)
+StealText.Font = Enum.Font.GothamBold
+StealText.TextSize = 11
+StealText.Parent = StealBadge
+
+--// Minimize
+local Minimize = Instance.new("TextButton")
+Minimize.Size = UDim2.fromOffset(32, 34)
+Minimize.Position = UDim2.new(1, -80, 0, 9)
+Minimize.BackgroundColor3 = Color3.fromRGB(55, 75, 110)
+Minimize.Text = "−"
+Minimize.TextColor3 = Color3.new(1, 1, 1)
+Minimize.Font = Enum.Font.GothamBold
+Minimize.TextSize = 20
+Minimize.Parent = Header
+
+Instance.new("UICorner", Minimize).CornerRadius = UDim.new(0, 7)
+
+--// Close
+local Close = Instance.new("TextButton")
+Close.Size = UDim2.fromOffset(32, 34)
+Close.Position = UDim2.new(1, -42, 0, 9)
+Close.BackgroundColor3 = Color3.fromRGB(180, 55, 65)
+Close.Text = "X"
+Close.TextColor3 = Color3.new(1, 1, 1)
+Close.Font = Enum.Font.GothamBold
+Close.TextSize = 14
+Close.Parent = Header
+
+Instance.new("UICorner", Close).CornerRadius = UDim.new(0, 7)
+
+Close.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+--// Status
+local Status = Instance.new("TextLabel")
+Status.Position = UDim2.new(0, 12, 0, 59)
+Status.Size = UDim2.new(1, -120, 0, 30)
+Status.BackgroundTransparency = 1
+Status.Font = Enum.Font.Gotham
+Status.Text = "Monitoring players..."
+Status.TextColor3 = Color3.fromRGB(160, 175, 200)
+Status.TextSize = 11
+Status.TextXAlignment = Enum.TextXAlignment.Left
+Status.Parent = Main
+
+--// Copy All
+local CopyAll = Instance.new("TextButton")
+CopyAll.Size = UDim2.fromOffset(92, 30)
+CopyAll.Position = UDim2.new(1, -104, 0, 59)
+CopyAll.BackgroundColor3 = Color3.fromRGB(55, 105, 190)
+CopyAll.Text = "COPY ALL"
+CopyAll.TextColor3 = Color3.new(1, 1, 1)
+CopyAll.Font = Enum.Font.GothamBold
+CopyAll.TextSize = 11
+CopyAll.Parent = Main
+
+Instance.new("UICorner", CopyAll).CornerRadius = UDim.new(0, 7)
+
+--// Copy fallback
+local CopyBox = Instance.new("TextBox")
+CopyBox.Position = UDim2.new(0, 12, 0, 94)
+CopyBox.Size = UDim2.new(1, -24, 0, 30)
+CopyBox.BackgroundColor3 = Color3.fromRGB(35, 42, 58)
+CopyBox.TextColor3 = Color3.new(1, 1, 1)
+CopyBox.PlaceholderText = "Select text to copy manually"
+CopyBox.ClearTextOnFocus = false
+CopyBox.TextEditable = true
+CopyBox.Font = Enum.Font.Gotham
+CopyBox.TextSize = 11
+CopyBox.Visible = false
+CopyBox.Parent = Main
+
+Instance.new("UICorner", CopyBox).CornerRadius = UDim.new(0, 6)
+
+--// Scrolling List
+local List = Instance.new("ScrollingFrame")
+List.Position = UDim2.new(0, 12, 0, 100)
+List.Size = UDim2.new(1, -24, 1, -146)
+List.BackgroundTransparency = 1
+List.BorderSizePixel = 0
+List.ScrollBarThickness = 4
+List.AutomaticCanvasSize = Enum.AutomaticSize.Y
+List.CanvasSize = UDim2.new(0, 0, 0, 0)
+List.Parent = Main
+
+local Layout = Instance.new("UIListLayout")
+Layout.Padding = UDim.new(0, 8)
+Layout.SortOrder = Enum.SortOrder.LayoutOrder
+Layout.Parent = List
+
+local Padding = Instance.new("UIPadding")
+Padding.PaddingTop = UDim.new(0, 3)
+Padding.PaddingBottom = UDim.new(0, 5)
+Padding.Parent = List
+
+local Empty = Instance.new("TextLabel")
+Empty.Size = UDim2.new(1, 0, 0, 60)
+Empty.BackgroundTransparency = 1
+Empty.Text = "No animations detected yet..."
+Empty.TextColor3 = Color3.fromRGB(130, 140, 160)
+Empty.Font = Enum.Font.Gotham
+Empty.TextSize = 12
+Empty.Parent = List
+
+--// Footer
+local Footer = Instance.new("TextLabel")
+Footer.Position = UDim2.new(0, 12, 1, -35)
+Footer.Size = UDim2.new(1, -24, 0, 25)
+Footer.BackgroundTransparency = 1
+Footer.Text = "Unique: 0 | Steals: 0 | Plays: 0"
+Footer.TextColor3 = Color3.fromRGB(130, 145, 175)
+Footer.Font = Enum.Font.Gotham
+Footer.TextSize = 11
+Footer.TextXAlignment = Enum.TextXAlignment.Left
+Footer.Parent = Main
+
+--// Minimize system
+local function setMinimized(value)
+    minimized = value
+
+    if minimized then
+        Main.Size = UDim2.new(0.9, 0, 0, 52)
+        Minimize.Text = "+"
+    else
+        Main.Size = ExpandedSize
+        Minimize.Text = "−"
+    end
+
+    Status.Visible = not minimized
+    CopyAll.Visible = not minimized
+    List.Visible = not minimized
+    Footer.Visible = not minimized
+    CopyBox.Visible = copyBoxActive and not minimized
 end
 
--- ============================================================
--- MAGNET TICK
--- ============================================================
-local function magnetTick()
-    local r = root(); if not r then return end
-    local orbs = getOrbsSorted(State.Range)
+Minimize.MouseButton1Click:Connect(function()
+    setMinimized(not minimized)
+end)
 
-    if #orbs == 0 then
-        State.Status = "no orbs"
+--// Clipboard
+local function copyText(value)
+    local clipboard
+
+    pcall(function()
+        clipboard = setclipboard
+    end)
+
+    if typeof(clipboard) == "function" then
+        local success = pcall(clipboard, value)
+
+        if success then
+            Status.Text = "Copied successfully!"
+            return
+        end
+    end
+
+    copyBoxActive = true
+    CopyBox.Text = value
+    CopyBox.Visible = not minimized
+    Status.Text = "Select the text to copy manually"
+
+    if not minimized then
+        CopyBox:CaptureFocus()
+        CopyBox.CursorPosition = #value + 1
+        CopyBox.SelectionStart = 1
+    end
+end
+
+--// Update stats
+local function updateStats()
+    Empty.Visible = #entries == 0
+
+    Footer.Text = string.format(
+        "Unique: %d | Steals: %d | Plays: %d",
+        #entries,
+        stealCount,
+        totalPlays
+    )
+
+    if stealCount > 0 then
+        StealBadge.Visible = true
+        StealText.Text = "STEAL x" .. stealCount
+    else
+        StealBadge.Visible = false
+    end
+end
+
+--// Add player to entry
+local function addUser(entry, player)
+    if entry.userSet[player.UserId] then
         return
     end
 
-    local target = orbs[1].pos
-    local count  = 1
+    entry.userSet[player.UserId] = true
 
-    if State.UseHitbox then
-        -- cluster orb ในรัศมีครึ่งของ hitbox
-        local clusters = clusterOrbs(orbs, State.HitboxSize * 0.4)
-        if #clusters > 0 then
-            table.sort(clusters, function(a, b)
-                return (a.center - r.Position).Magnitude < (b.center - r.Position).Magnitude
-            end)
-            target = clusters[1].center
-            count  = clusters[1].count
-        end
-    end
+    table.insert(
+        entry.users,
+        player.DisplayName .. " (@" .. player.Name .. ")"
+    )
 
-    r.CFrame = CFrame.new(target + Vector3.new(0, 5, 0))
-
-    -- อัปเดต hitbox ทันที
-    if State.MagnetPart and State.MagnetPart.Parent then
-        State.MagnetPart.CFrame = r.CFrame
-    end
-
-    State.Status = string.format("magnet (%d orbs)", count)
+    entry.playersLabel.Text =
+        "Players (" .. #entry.users .. "): " ..
+        table.concat(entry.users, ", ")
 end
 
--- ============================================================
--- WORKER LOOP
--- ============================================================
-local function startWorker()
-    if State.Running then return end
-    State.Running = true
+--// แจ้งเตือนจุดเขียวแบบชั่วคราวบนหน้าจอ (toast)
+local function stealToast(playerName, animName, id)
+    local toast = Instance.new("Frame")
+    toast.Size = UDim2.fromOffset(300, 56)
+    toast.Position = UDim2.new(0.5, -150, 0, -80)
+    toast.BackgroundColor3 = Color3.fromRGB(14, 40, 24)
+    toast.BorderSizePixel = 0
+    toast.Parent = ScreenGui
 
-    task.spawn(function()
-        while State.Enabled do
-            if not alive() or blocked() then
-                task.wait(0.25)
-                continue
-            end
+    Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 10)
 
-            doSprint()
-            doEvolve()
+    local ts = Instance.new("UIStroke")
+    ts.Color = Color3.fromRGB(60, 255, 120)
+    ts.Thickness = 2
+    ts.Parent = toast
 
-            pcall(magnetTick)
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(12, 12)
+    dot.Position = UDim2.new(0, 12, 0.5, -6)
+    dot.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
+    dot.Parent = toast
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-            if State.KillBugs then
-                local bug = findNearestBug(50)
-                if bug then
-                    local hrp = bug:FindFirstChild("HumanoidRootPart")
-                    if hrp and (hrp.Position - root().Position).Magnitude <= 5 then
-                        doAttack(bug)
-                    end
-                end
-            end
+    local title = Instance.new("TextLabel")
+    title.Position = UDim2.new(0, 32, 0, 8)
+    title.Size = UDim2.new(1, -40, 0, 18)
+    title.BackgroundTransparency = 1
+    title.Text = "STEAL DETECTED — " .. playerName
+    title.TextColor3 = Color3.fromRGB(60, 255, 120)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = toast
 
-            task.wait(1 / math.max(State.Speed, 1))
-        end
-        State.Running = false
+    local sub = Instance.new("TextLabel")
+    sub.Position = UDim2.new(0, 32, 0, 28)
+    sub.Size = UDim2.new(1, -40, 0, 20)
+    sub.BackgroundTransparency = 1
+    sub.Text = animName .. " [" .. id .. "]"
+    sub.TextColor3 = Color3.fromRGB(200, 230, 210)
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 10
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.TextTruncate = Enum.TextTruncate.AtEnd
+    sub.Parent = toast
+
+    TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0.5, -150, 0, 12)
+    }):Play()
+
+    task.delay(2.5, function()
+        local t = TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5, -150, 0, -80)
+        })
+        t:Play()
+        t.Completed:Once(function()
+            toast:Destroy()
+        end)
     end)
 end
 
--- ============================================================
--- HOOKS
--- ============================================================
-LP.CharacterAdded:Connect(function()
-    State.MagnetPart = nil
-    task.wait(1)
-    if State.Enabled and State.UseHitbox then
-        setupMagnetPart()
+--// Detect animation
+local function detectAnimation(player, track)
+    if not ScreenGui.Parent then return end
+    if not player or not track then return end
+
+    -- กันนับ Plays ซ้ำ (track เดียวกัน)
+    local alreadyCounted = seenTracks[track]
+    if not alreadyCounted then
+        seenTracks[track] = true
+        totalPlays += 1
     end
-end)
 
--- ============================================================
--- RAYFIELD UI
--- ============================================================
-local Window = Rayfield:CreateWindow({
-    Name = "Bug Evolution — Magnet Farm",
-    LoadingTitle = "Loading Magnet Farm",
-    LoadingSubtitle = "XP Magnet + Fast TP",
-    Theme = "Default",
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = "BugEvoMagnet",
-        FileName = "Config",
-    },
-    KeySystem = false,
-})
+    local animation
+    pcall(function()
+        animation = track.Animation
+    end)
+    if not animation then return end
 
--- ---------------- Main Tab ----------------
-local MainTab = Window:CreateTab("Farm", 4483362458)
+    local id = animation.AnimationId
+    if not id or id == "" then return end
 
-MainTab:CreateToggle({
-    Name = "🔮 Master Switch",
-    CurrentValue = false,
-    Flag = "Master",
-    Callback = function(v)
-        State.Enabled = v
-        if v then
-            if State.UseHitbox then setupMagnetPart() end
-            startWorker()
+    local normalizedID =
+        id:match("[?&]id=(%d+)")
+        or id:match("rbxassetid://(%d+)")
+        or id:match("(%d+)$")
+        or id
+
+    local name = animation.Name
+    if not name or name == "" or name == "Animation" then
+        name = track.Name
+    end
+    if not name or name == "" or name == "Animation" then
+        name = "Unnamed Animation"
+    end
+
+    -- จำแนกประเภท
+    local category = classify(track, animation, name, id)
+    local isSteal = category == "steal"
+
+    -- ถ้าเป็น steal และยังไม่เคยเจอ ID นี้ → แจ้งเตือนจุดเขียว
+    if isSteal and not entryMap[normalizedID] then
+        stealCount += 1
+        stealToast(player.DisplayName, name, id)
+        Status.Text = "⚠ STEAL DETECTED: " .. name
+        Status.TextColor3 = Color3.fromRGB(60, 255, 120)
+        task.delay(3, function()
+            if Status.Text:find("STEAL") then
+                Status.Text = "Monitoring players..."
+                Status.TextColor3 = Color3.fromRGB(160, 175, 200)
+            end
+        end)
+    end
+
+    -- Same ID = same entry globally
+    local existing = entryMap[normalizedID]
+
+    if existing then
+        existing.plays += 1
+        addUser(existing, player)
+
+        existing.info.Text =
+            "ID: " .. existing.id ..
+            " | Plays: " .. existing.plays ..
+            " | " .. existing.category
+
+        updateStats()
+        return
+    end
+
+    -- New unique animation
+    local row = Instance.new("Frame")
+    row.Name = "AnimationEntry"
+    row.Size = UDim2.new(1, -5, 0, 92)
+    row.BackgroundColor3 = isSteal
+        and Color3.fromRGB(18, 45, 28)   -- พื้นเขียวอ่อนสำหรับ steal
+        or Color3.fromRGB(30, 36, 50)
+    row.BorderSizePixel = 0
+    -- steal ขึ้นบนสุดเสมอ
+    row.LayoutOrder = isSteal and -100000 - #entries or -#entries - 1
+    row.Parent = List
+
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local rowStroke = Instance.new("UIStroke")
+    rowStroke.Color = isSteal and Color3.fromRGB(60, 255, 120) or Color3.fromRGB(55, 67, 90)
+    rowStroke.Thickness = isSteal and 2 or 1
+    rowStroke.Parent = row
+
+    -- แถบสีด้านซ้ายสำหรับ steal
+    if isSteal then
+        local accent = Instance.new("Frame")
+        accent.Size = UDim2.new(0, 4, 1, 0)
+        accent.BackgroundColor3 = Color3.fromRGB(60, 255, 120)
+        accent.BorderSizePixel = 0
+        accent.Parent = row
+        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 8)
+    end
+
+    -- Animation name (พร้อมจุดเขียวถ้าเป็น steal)
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Position = UDim2.new(0, isSteal and 18 or 9, 0, 5)
+    nameLabel.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 19)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = (isSteal and "🟢 " or "") .. "Animation: " .. name
+    nameLabel.TextColor3 = isSteal
+        and Color3.fromRGB(120, 255, 160)
+        or Color3.fromRGB(225, 235, 255)
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 11
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    nameLabel.Parent = row
+
+    -- Players
+    local playersLabel = Instance.new("TextLabel")
+    playersLabel.Position = UDim2.new(0, isSteal and 18 or 9, 0, 26)
+    playersLabel.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 24)
+    playersLabel.BackgroundTransparency = 1
+    playersLabel.TextColor3 = Color3.fromRGB(145, 165, 200)
+    playersLabel.Font = Enum.Font.Gotham
+    playersLabel.TextSize = 9
+    playersLabel.TextXAlignment = Enum.TextXAlignment.Left
+    playersLabel.TextYAlignment = Enum.TextYAlignment.Top
+    playersLabel.TextWrapped = true
+    playersLabel.Parent = row
+
+    -- ID + Plays + Category
+    local info = Instance.new("TextLabel")
+    info.Position = UDim2.new(0, isSteal and 18 or 9, 0, 57)
+    info.Size = UDim2.new(1, -105 - (isSteal and 9 or 0), 0, 25)
+    info.BackgroundTransparency = 1
+    info.Text = "ID: " .. id .. " | Plays: 1 | " .. category
+    info.TextColor3 = Color3.fromRGB(145, 165, 200)
+    info.Font = Enum.Font.Gotham
+    info.TextSize = 9
+    info.TextXAlignment = Enum.TextXAlignment.Left
+    info.TextTruncate = Enum.TextTruncate.AtEnd
+    info.Parent = row
+
+    -- Copy ID
+    local Copy = Instance.new("TextButton")
+    Copy.Size = UDim2.fromOffset(78, 30)
+    Copy.Position = UDim2.new(1, -87, 0.5, -15)
+    Copy.BackgroundColor3 = isSteal
+        and Color3.fromRGB(30, 130, 70)
+        or Color3.fromRGB(50, 105, 175)
+    Copy.Text = "COPY ID"
+    Copy.TextColor3 = Color3.new(1, 1, 1)
+    Copy.Font = Enum.Font.GothamBold
+    Copy.TextSize = 10
+    Copy.Parent = row
+
+    Instance.new("UICorner", Copy).CornerRadius = UDim.new(0, 6)
+
+    local entry = {
+        id = id,
+        name = name,
+        plays = 1,
+        category = category,
+        isSteal = isSteal,
+        users = {},
+        userSet = {},
+        playersLabel = playersLabel,
+        info = info
+    }
+
+    entryMap[normalizedID] = entry
+    table.insert(entries, entry)
+
+    addUser(entry, player)
+
+    Copy.MouseButton1Click:Connect(function()
+        copyText(id)
+    end)
+
+    updateStats()
+
+    if isSteal then
+        Status.Text = "🟢 New STEAL animation detected!"
+        Status.TextColor3 = Color3.fromRGB(60, 255, 120)
+    else
+        Status.Text = "New unique animation detected!"
+        Status.TextColor3 = Color3.fromRGB(160, 175, 200)
+    end
+end
+
+--// Copy all
+CopyAll.MouseButton1Click:Connect(function()
+    if #entries == 0 then
+        Status.Text = "Nothing to copy!"
+        return
+    end
+
+    local steals = {}
+    local others = {}
+
+    for _, entry in ipairs(entries) do
+        local block =
+            "Animation: " .. entry.name ..
+            "\nID: " .. entry.id ..
+            "\nCategory: " .. entry.category ..
+            "\nPlayers: " .. table.concat(entry.users, ", ") ..
+            "\nPlays: " .. entry.plays
+
+        if entry.isSteal then
+            table.insert(steals, block)
         else
-            removeMagnetPart()
-            if hum() then hum():MoveTo(hum().RootPart.Position) end
+            table.insert(others, block)
         end
-    end,
-})
+    end
 
-MainTab:CreateSection("Magnet Settings")
+    local output = {}
 
-MainTab:CreateSlider({
-    Name = "⚡ ความเร็ว TP (Orb/วินาที)",
-    Range = { 30, 240 },
-    Increment = 10,
-    Suffix = " orb/s",
-    CurrentValue = 60,
-    Flag = "Speed",
-    Callback = function(v) State.Speed = v end,
-})
+    if #steals > 0 then
+        table.insert(output, "=== STEAL ANIMATIONS (" .. #steals .. ") ===")
+        table.insert(output, table.concat(steals, "\n\n"))
+    end
 
-MainTab:CreateSlider({
-    Name = "📏 ระยะค้นหา orb (studs)",
-    Range = { 50, 2000 },
-    Increment = 25,
-    Suffix = " studs",
-    CurrentValue = 600,
-    Flag = "Range",
-    Callback = function(v) State.Range = v end,
-})
+    if #others > 0 then
+        table.insert(output, "=== OTHER ANIMATIONS (" .. #others .. ") ===")
+        table.insert(output, table.concat(others, "\n\n"))
+    end
 
-MainTab:CreateToggle({
-    Name = "🎯 ใช้ Hitbox รวบกลุ่ม (แนะนำ)",
-    CurrentValue = true,
-    Flag = "UseHitbox",
-    Callback = function(v)
-        State.UseHitbox = v
-        if v and State.Enabled then
-            setupMagnetPart()
-        elseif not v then
-            removeMagnetPart()
+    copyText(table.concat(output, "\n\n"))
+end)
+
+--// Watch animator
+local function watchAnimator(animator, player)
+    if monitored[animator] then return end
+    monitored[animator] = true
+
+    animator.AnimationPlayed:Connect(function(track)
+        detectAnimation(player, track)
+    end)
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        detectAnimation(player, track)
+    end
+end
+
+--// Watch character
+local function watchCharacter(player, character)
+    if not character then return end
+
+    local function check(obj)
+        if obj:IsA("Animator") then
+            watchAnimator(obj, player)
         end
-    end,
-})
+    end
 
-MainTab:CreateSlider({
-    Name = "📦 ขนาด Hitbox (studs)",
-    Range = { 8, 50 },
-    Increment = 2,
-    Suffix = " studs",
-    CurrentValue = 20,
-    Flag = "HitboxSize",
-    Callback = function(v)
-        State.HitboxSize = v
-        updateMagnetPartSize()
-    end,
-})
+    character.DescendantAdded:Connect(check)
 
-MainTab:CreateSection("เสริม")
+    for _, obj in ipairs(character:GetDescendants()) do
+        check(obj)
+    end
+end
 
-MainTab:CreateToggle({
-    Name = "🧬 Evolve อัตโนมัติ",
-    CurrentValue = false,
-    Flag = "AutoEvolve",
-    Callback = function(v) State.AutoEvolve = v end,
-})
+local function watchPlayer(player)
+    player.CharacterAdded:Connect(function(character)
+        watchCharacter(player, character)
+    end)
 
-MainTab:CreateToggle({
-    Name = "🏃 Auto Sprint",
-    CurrentValue = true,
-    Flag = "AutoSprint",
-    Callback = function(v) State.AutoSprint = v end,
-})
+    if player.Character then
+        watchCharacter(player, player.Character)
+    end
+end
 
-MainTab:CreateToggle({
-    Name = "🐛 กัดแมลงใกล้ตัว",
-    CurrentValue = false,
-    Flag = "KillBugs",
-    Callback = function(v) State.KillBugs = v end,
-})
+for _, player in ipairs(Players:GetPlayers()) do
+    watchPlayer(player)
+end
+Players.PlayerAdded:Connect(watchPlayer)
 
--- ---------------- Info Tab ----------------
-local InfoTab = Window:CreateTab("สถานะ", 4483362458)
+--// Draggable
+local dragging = false
+local dragStart
+local startPosition
 
-local StatusLabel = InfoTab:CreateParagraph({
-    Title = "สถานะ",
-    Content = "idle",
-})
-
-task.spawn(function()
-    while task.wait(0.2) do
-        StatusLabel:Set({
-            Title = State.Enabled and "✅ Farm: ON" or "❌ Farm: OFF",
-            Content = string.format(
-                "Speed: %d orb/s\nRange: %d studs\nHitbox: %s (%d)\nStatus: %s",
-                State.Speed, State.Range,
-                State.UseHitbox and "ON" or "OFF",
-                State.HitboxSize, State.Status
-            ),
-        })
+Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = Main.Position
     end
 end)
 
-InfoTab:CreateParagraph({
-    Title = "📖 คำอธิบาย",
-    Content = "🔮 Magnet = วาปเก็บ XP Orb ในแมพ\n" ..
-              "  • Hitbox = รวบ orb ทีละกลุ่ม (ได้หลาย orb/การวาป 1 ครั้ง)\n" ..
-              "  • Speed = จำนวน TP/วินาที (60-120 ดีสุด)\n" ..
-              "  • Range = รัศมีหา orb (ยิ่งเยอะยิ่งไว)\n\n" ..
-              "⚡ เริ่มต้น: Speed 60, Range 600, Hitbox 20\n" ..
-              "🚀 เร็วขึ้น: Speed 120, Range 1000, Hitbox 25\n\n" ..
-              "⚠️ Speed > 150 server อาจ drop\n" ..
-              "⚠️ Hitbox > 30 เสี่ยง anti-cheat"
-})
+UIS.InputChanged:Connect(function(input)
+    if dragging and (
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    ) then
+        local delta = input.Position - dragStart
+        Main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end)
 
--- ---------------- Tools Tab ----------------
-local ToolsTab = Window:CreateTab("Tools", 4483362458)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
 
-ToolsTab:CreateButton({
-    Name = "🧪 ทดสอบ Magnet (วาปครั้งเดียว)",
-    Callback = function()
-        if not State.Enabled then
-            Rayfield:Notify({
-                Title = "ยังไม่เปิด Farm",
-                Content = "เปิด Master Switch ก่อน",
-                Duration = 3,
-            })
-            return
-        end
-        pcall(magnetTick)
-    end,
-})
+updateStats()
 
-ToolsTab:CreateButton({
-    Name = "🔍 นับ Orb ในรัศมี",
-    Callback = function()
-        local orbs = getOrbsSorted(State.Range)
-        Rayfield:Notify({
-            Title = "ผลนับ Orb",
-            Content = string.format("พบ %d orb ในรัศมี %d studs", #orbs, State.Range),
-            Duration = 4,
-        })
-    end,
-})
-
-ToolsTab:CreateButton({
-    Name = "↩️ Teleport ไป Spawn",
-    Callback = function()
-        local r = root(); if r then
-            r.CFrame = CFrame.new(0, 20, 180)
-        end
-    end,
-})
-
-ToolsTab:CreateButton({
-    Name = "⏹️ หยุดทุกอย่าง",
-    Callback = function()
-        State.Enabled = false
-        removeMagnetPart()
-        if hum() then hum():MoveTo(hum().RootPart.Position) end
-    end,
-})
-
--- ============================================================
--- WELCOME NOTIFY
--- ============================================================
-Rayfield:Notify({
-    Title = "🔮 Magnet Farm พร้อม!",
-    Content = "เปิด Master Switch ในแท็บ Farm เพื่อเริ่มเก็บ level",
-    Duration = 6,
-    Image = 4483362458,
-})
+print("[Animation Detector V3] Loaded with Steal Detection!")
